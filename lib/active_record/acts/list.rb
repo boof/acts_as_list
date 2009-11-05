@@ -17,7 +17,12 @@ module ActiveRecord
     #
     #   todo_list.first.move_to_bottom
     #   todo_list.last.move_higher
+    #
+    # Wikipedia says: higher := higher_position > lower_position
+    # whereas ActsAsList says: higher := higher_position < lower_position
     module List
+      DEF_POSITION_COLUMN = %Q"def position_column; '%s' end"
+      DEFAULT_OPTIONS = { :column => :position, :scope => '1 = 1' }
       # Configuration options are:
       #
       # * +column+ - specifies the column name to use for keeping the position integer (default: +position+)
@@ -26,18 +31,31 @@ module ActiveRecord
       #   to give it an entire string that is interpolated if you need a tighter scope than just a foreign key.
       #   Example: <tt>acts_as_list :scope => 'todo_list_id = #{todo_list_id} AND completed = 0'</tt>
       def acts_as_list(options = {})
-        configuration = { :column => :position, :scope => '1 = 1' }
-        configuration.update options if options.is_a? Hash
+        options = DEFAULT_OPTIONS.merge options if Hash === options
 
-        scope = configuration.delete :scope
-        named_scope :listed_with, if scope.is_a? Symbol
-            scope = :"#{ scope }_id" if "#{ scope }"[-3..-1] != '_id'
-            proc {|r| { :conditions => { scope => r.send(scope) } } }
-          else
-            proc {|r| { :conditions => r.instance_eval(%Q'"#{ scope }"') } }
-          end
+        column  = options[:column].to_s
+        class_eval DEF_POSITION_COLUMN % column
 
-        class_eval "def position_column; '#{ configuration[:column] }' end"
+        scope   = options[:scope]
+        if scope.is_a? Symbol
+          scope = :"#{ scope }_id" if scope.to_s[-3..-1] != '_id'
+          scope_opts = proc { |r|
+            conditions = { scope => r.send(scope) }
+            list(conditions).proxy_options
+          }
+        elsif '1 = 1' == scope
+          scope_opts = { :order => column }
+        else
+          scope_opts = proc { |r|
+            conditions = r.instance_eval %Q'"#{ scope }"'
+            list(conditions).proxy_options
+          }
+        end
+
+        named_scope :listed_with, scope_opts
+        named_scope :list, proc { |*conditions|
+          { :conditions => conditions.first, :order => column }
+        }
 
         include ActiveRecord::Acts::List::InstanceMethods
         before_destroy :remove_from_list
@@ -96,22 +114,22 @@ module ActiveRecord
 
         # Increase the position of this item without adjusting the rest of the list.
         def increment_position
-          update_attribute position_column, lower_position if in_list?
+          update_attribute position_column, lower_position if listed?
         end
 
         # Decrease the position of this item without adjusting the rest of the list.
         def decrement_position
-          update_attribute position_column, higher_position if in_list?
+          update_attribute position_column, higher_position if listed?
         end
 
         # Return +true+ if this object is the first in the list.
         def first?
-          in_list? && send(position_column) == 1
+          listed? && send(position_column) == 1
         end
 
         # Return +true+ if this object is the last in the list.
         def last?
-          in_list? && send(position_column) == bottom_position_in_list
+          listed? && send(position_column) == bottom_position_in_list
         end
 
         # Returns the position of the next higher item
@@ -125,28 +143,28 @@ module ActiveRecord
 
         # Return the next higher item in the list.
         def higher_item
-          if in_list?
+          if listed?
             higher = "#{ position_column } = #{ higher_position }"
-            self.class.base_class.listed_with(self).first :conditions => higher
+            self.class.listed_with(self).first :conditions => higher
           end
         end
 
         # Return the next lower item in the list.
         def lower_item
-          if in_list?
+          if listed?
             higher = "#{ position_column } = #{ lower_position }"
-            self.class.base_class.listed_with(self).first :conditions => higher
+            self.class.listed_with(self).first :conditions => higher
           end
         end
 
         # Test if this record is in a list
-        def in_list?
-          send position_column
+        def listed?
+          read_attribute position_column
         end
 
         # Executes given block in transaction if record is in a list
         def transaction_if_listed
-          block_given? && in_list? || return
+          block_given? && listed? || return
           self.class.transaction { yield }
         end
 
@@ -166,7 +184,7 @@ module ActiveRecord
           options[:conditions] = ["#{ self.class.primary_key } NOT IN (?)",
               except.map { |e| e.id }] unless except.empty?
 
-          self.class.base_class.listed_with(self).maximum position_column, options
+          self.class.listed_with(self).maximum position_column, options
         end
 
         # Returns the bottom item
@@ -175,7 +193,7 @@ module ActiveRecord
           options[:conditions] = ["#{ self.class.primary_key } NOT IN (?)",
               except.map { |e| e.id }] unless except.empty?
 
-          self.class.base_class.listed_with(self).first options
+          self.class.listed_with(self).first options
         end
 
         # Forces item to assume the bottom position in the list.
@@ -190,7 +208,7 @@ module ActiveRecord
 
         # This has the effect of moving all the higher items up one.
         def decrement_positions_on_higher_items(position)
-          self.class.base_class.listed_with(self).update_all(
+          self.class.listed_with(self).update_all(
           "#{ position_column } = (#{ position_column } - 1)",
           "#{ position_column } <= #{ position }"
           )
@@ -198,23 +216,23 @@ module ActiveRecord
 
         # This has the effect of moving all the lower items up one.
         def decrement_positions_on_lower_items
-          self.class.base_class.listed_with(self).update_all(
+          self.class.listed_with(self).update_all(
           "#{ position_column } = (#{ position_column } - 1)",
           "#{ position_column } > #{ send position_column }"
-          ) if in_list?
+          ) if listed?
         end
 
         # This has the effect of moving all the higher items down one.
         def increment_positions_on_higher_items
-          self.class.base_class.listed_with(self).update_all(
+          self.class.listed_with(self).update_all(
           "#{ position_column } = (#{ position_column } + 1)",
           "#{ position_column } < #{ send position_column }"
-          ) if in_list?
+          ) if listed?
         end
 
         # This has the effect of moving all the lower items down one.
         def increment_positions_on_lower_items(position)
-          self.class.base_class.listed_with(self).update_all(
+          self.class.listed_with(self).update_all(
           "#{ position_column } = (#{ position_column } + 1)",
           "#{ position_column } >= #{ position }"
           )
@@ -222,7 +240,7 @@ module ActiveRecord
 
         # Increments position (<tt>position_column</tt>) of all items in the list.
         def increment_positions_on_all_items
-          self.class.base_class.listed_with(self).
+          self.class.listed_with(self).
               update_all "#{ position_column } = (#{ position_column } + 1)"
         end
 
